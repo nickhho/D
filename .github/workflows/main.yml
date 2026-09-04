@@ -1,4 +1,4 @@
-name: Build GKI Kernel 5.10 with KernelSU
+name: Build GKI Kernel 5.10 for Gaming with KernelSU
 
 on:
   push:
@@ -12,6 +12,20 @@ on:
         required: false
         default: 'gki_defconfig'
         type: string
+      gaming_mode:
+        description: 'Enable Gaming Optimizations'
+        required: false
+        default: 'true'
+        type: boolean
+      performance_profile:
+        description: 'Performance Profile (balanced/gaming/extreme)'
+        required: false
+        default: 'gaming'
+        type: choice
+        options:
+          - balanced
+          - gaming
+          - extreme
 
 env:
   KERNEL_SOURCE: https://github.com/ramabondanp/android_kernel_common-5.10
@@ -20,6 +34,9 @@ env:
   KERNEL_VERSION: 5.10
   ANDROID_VERSION: 12
   CLANG_VERSION: r498229b
+  CLANG_URL: https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/master/clang-r498229b.tar.gz
+  CLANG_URL_ALT: https://github.com/LineageOS/android_prebuilts_clang_host_linux-x86_clang-r498229b/archive/refs/heads/lineage-21.0.tar.gz
+  GCC_URL: https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/+archive/refs/heads/master.tar.gz
 
 jobs:
   build-kernel:
@@ -57,7 +74,13 @@ jobs:
           xmlto \
           docbook-utils \
           fakeroot \
-          build-essential
+          build-essential \
+          libncurses-dev \
+          libglib2.0-dev \
+          libfdt-dev \
+          libpixman-1-dev \
+          python3-pexpect \
+          aria2
 
     - name: Setup ccache
       uses: hendrikmuhs/ccache-action@v1.2
@@ -83,35 +106,68 @@ jobs:
 
     - name: Setup Clang toolchain
       run: |
-        wget -O clang.zip https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-${{ env.CLANG_VERSION }}.tar.gz
         mkdir -p clang
-        tar -xzf clang.zip -C clang
-        echo "PATH=$(pwd)/clang/bin:$PATH" >> $GITHUB_ENV
         
-        # Setup GCC for compatibility
-        wget -O gcc-arm64.tar.xz https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/+archive/refs/heads/main.tar.gz
-        mkdir -p gcc-arm64
-        tar -xf gcc-arm64.tar.xz -C gcc-arm64
-        echo "PATH=$(pwd)/gcc-arm64/bin:$PATH" >> $GITHUB_ENV
+        # Try primary URL
+        echo "Attempting to download Clang from primary URL..."
+        if wget -O clang.zip ${{ env.CLANG_URL }} 2>/dev/null; then
+          echo "Primary download successful"
+        else
+          echo "Primary download failed, trying alternative..."
+          # Try alternative URL from LineageOS
+          if wget -O clang.tar.gz ${{ env.CLANG_URL_ALT }} 2>/dev/null; then
+            echo "Alternative download successful"
+            tar -xzf clang.tar.gz -C clang --strip-components=1
+            echo "CLANG_ALT=true" >> $GITHUB_ENV
+          else
+            echo "All Clang downloads failed. Using system clang..."
+            sudo apt-get install -y clang-15 lld-15
+            sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-15 100
+            sudo update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-15 100
+            sudo update-alternatives --install /usr/bin/lld lld /usr/bin/lld-15 100
+            echo "CLANG_SYSTEM=true" >> $GITHUB_ENV
+          fi
+        fi
+        
+        # Extract if clang.zip exists
+        if [ -f "clang.zip" ]; then
+          unzip -q clang.zip -d clang
+        fi
+        
+        # Set PATH
+        if [ -d "clang/bin" ]; then
+          echo "PATH=$(pwd)/clang/bin:$PATH" >> $GITHUB_ENV
+          echo "CLANG_FOUND=true" >> $GITHUB_ENV
+        fi
+        
+        # Setup GCC
+        echo "Setting up GCC..."
+        if wget -O gcc-arm64.tar.gz ${{ env.GCC_URL }}; then
+          mkdir -p gcc-arm64
+          tar -xzf gcc-arm64.tar.gz -C gcc-arm64
+          echo "PATH=$(pwd)/gcc-arm64/bin:$PATH" >> $GITHUB_ENV
+          echo "GCC_FOUND=true" >> $GITHUB_ENV
+        else
+          echo "GCC download failed, installing from apt..."
+          sudo apt-get install -y gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+          echo "GCC_SYSTEM=true" >> $GITHUB_ENV
+        fi
+        
+        # Verify toolchain
+        echo "Toolchain verification:"
+        which clang || echo "clang not found"
+        which aarch64-linux-android-gcc || echo "gcc not found"
+        clang --version || echo "clang version check failed"
 
     - name: Apply KernelSU patches
       run: |
         cd kernel
-        # Check if KernelSU has setup scripts
         if [ -f "KernelSU/setup.sh" ]; then
           bash KernelSU/setup.sh
         else
-          # Manual KernelSU integration
-          # For GKI kernels
-          echo "Applying KernelSU patches..."
           KERNELSU_DIR=$(pwd)/KernelSU
-          
-          # Apply kernel patches
           if [ -d "$KERNELSU_DIR/kernel" ]; then
-            # Copy kernel files
             cp -r $KERNELSU_DIR/kernel/* .
-            
-            # Apply any patches if they exist
             if [ -d "$KERNELSU_DIR/patches" ]; then
               for patch in $KERNELSU_DIR/patches/*.patch; do
                 patch -p1 < $patch || true
@@ -120,172 +176,343 @@ jobs:
           fi
         fi
 
-    - name: Configure kernel
+    - name: Configure kernel with gaming optimizations
       run: |
         cd kernel
-        # Clean any previous builds
-        make clean || true
-        make mrproper || true
-        
-        # Set up environment variables for cross compilation
         export ARCH=arm64
         export CROSS_COMPILE=aarch64-linux-android-
         export CLANG_TRIPLE=aarch64-linux-gnu-
         export LLVM=1
         export LLVM_IAS=1
+        
+        # Use system clang if available
+        if [ "$CLANG_SYSTEM" = "true" ]; then
+          export CC=clang
+          export HOSTCC=clang
+        fi
+        
+        # Clean previous builds
+        make clean || true
+        make mrproper || true
         
         # Use custom defconfig or default
         DEFCONFIG="${{ github.event.inputs.custom_config || 'gki_defconfig' }}"
         make $DEFCONFIG
         
-        # Enable KernelSU configs if needed
-        echo "CONFIG_KSU=y" >> .config
-        echo "CONFIG_KSU_SUSFS=y" >> .config
+        # ============================================
+        # GAMING OPTIMIZATIONS
+        # ============================================
         
-        # Set CONFIG_HZ to 300 for better performance
-        echo "CONFIG_HZ_300=y" >> .config
-        echo "CONFIG_HZ=300" >> .config
-        sed -i 's/CONFIG_HZ=.*/CONFIG_HZ=300/' .config
+        # Determine performance profile
+        PROFILE="${{ github.event.inputs.performance_profile || 'gaming' }}"
         
-        # Disable any problematic configs
-        echo "# Disable problematic options" >> .config
+        # Disable ALL logging for gaming
+        echo "# ===== DISABLE LOGGING FOR GAMING =====" >> .config
+        echo "CONFIG_PRINTK=n" >> .config
+        echo "CONFIG_DEBUG_KERNEL=n" >> .config
         echo "CONFIG_DEBUG_INFO=n" >> .config
         echo "CONFIG_DEBUG_INFO_REDUCED=n" >> .config
         echo "CONFIG_DEBUG_INFO_COMPRESSED=n" >> .config
         echo "CONFIG_DEBUG_FS=n" >> .config
-        echo "CONFIG_DEBUG_KERNEL=n" >> .config
+        echo "CONFIG_DEBUG_MISC=n" >> .config
+        echo "CONFIG_DEBUG_PAGEALLOC=n" >> .config
+        echo "CONFIG_DEBUG_OBJECTS=n" >> .config
+        echo "CONFIG_DEBUG_SLAB=n" >> .config
+        echo "CONFIG_DEBUG_KMEMLEAK=n" >> .config
+        echo "CONFIG_DEBUG_LOCKING=n" >> .config
+        echo "CONFIG_DEBUG_LOCK_ALLOC=n" >> .config
+        echo "CONFIG_DEBUG_SPINLOCK=n" >> .config
+        echo "CONFIG_DEBUG_MUTEXES=n" >> .config
+        echo "CONFIG_DEBUG_RT_MUTEXES=n" >> .config
+        echo "CONFIG_DEBUG_SEMAPHORE=n" >> .config
+        echo "CONFIG_DEBUG_RWSEMS=n" >> .config
+        echo "CONFIG_DEBUG_WW_MUTEX_SLOWPATH=n" >> .config
+        echo "CONFIG_DEBUG_IRQFLAGS=n" >> .config
+        echo "CONFIG_DEBUG_BUGVERBOSE=n" >> .config
+        echo "CONFIG_DEBUG_LIST=n" >> .config
+        echo "CONFIG_DEBUG_PLIST=n" >> .config
+        echo "CONFIG_DEBUG_SG=n" >> .config
+        echo "CONFIG_DEBUG_NOTIFIERS=n" >> .config
+        echo "CONFIG_DEBUG_CREDENTIALS=n" >> .config
+        echo "CONFIG_DEBUG_VM=n" >> .config
+        echo "CONFIG_DEBUG_VM_PGFLAGS=n" >> .config
+        echo "CONFIG_DEBUG_VIRTUAL=n" >> .config
+        echo "CONFIG_DEBUG_MEMORY_INIT=n" >> .config
+        echo "CONFIG_DEBUG_HIGHMEM=n" >> .config
+        echo "CONFIG_DEBUG_SHIRQ=n" >> .config
+        
+        # Disable tracing
+        echo "CONFIG_TRACING=n" >> .config
+        echo "CONFIG_FTRACE=n" >> .config
+        echo "CONFIG_FUNCTION_TRACER=n" >> .config
+        echo "CONFIG_FUNCTION_GRAPH_TRACER=n" >> .config
+        echo "CONFIG_SCHED_TRACER=n" >> .config
+        echo "CONFIG_HW_BREAKPOINT=n" >> .config
+        echo "CONFIG_UPROBES=n" >> .config
+        echo "CONFIG_KPROBES=n" >> .config
+        echo "CONFIG_KPROBE_EVENTS=n" >> .config
+        echo "CONFIG_UPROBE_EVENTS=n" >> .config
+        echo "CONFIG_DYNAMIC_FTRACE=n" >> .config
+        echo "CONFIG_FUNCTION_PROFILER=n" >> .config
+        echo "CONFIG_STACK_TRACER=n" >> .config
+        
+        # Disable kernel debugging
+        echo "CONFIG_KGDB=n" >> .config
+        echo "CONFIG_KGDB_SERIAL_CONSOLE=n" >> .config
+        echo "CONFIG_KGDB_TESTS=n" >> .config
+        echo "CONFIG_KGDB_KDB=n" >> .config
+        echo "CONFIG_KDB_KEYBOARD=n" >> .config
+        echo "CONFIG_CRASH_DUMP=n" >> .config
+        echo "CONFIG_KEXEC=n" >> .config
+        echo "CONFIG_KEXEC_CORE=n" >> .config
+        
+        # ============================================
+        # CPU & SCHEDULER OPTIMIZATIONS
+        # ============================================
+        
+        # Set HZ to 300 for gaming
+        echo "CONFIG_HZ_300=y" >> .config
+        echo "CONFIG_HZ=300" >> .config
+        sed -i 's/CONFIG_HZ=.*/CONFIG_HZ=300/' .config
+        
+        # Enable high-performance scheduler features
+        echo "CONFIG_SCHED_DEBUG=n" >> .config
+        echo "CONFIG_SCHED_INFO=n" >> .config
+        echo "CONFIG_SCHEDSTATS=n" >> .config
+        echo "CONFIG_SCHED_CORE=y" >> .config
+        echo "CONFIG_CGROUP_SCHED=y" >> .config
+        echo "CONFIG_FAIR_GROUP_SCHED=y" >> .config
+        echo "CONFIG_RT_GROUP_SCHED=y" >> .config
+        
+        # Enable EAS
+        echo "CONFIG_ENERGY_MODEL=y" >> .config
+        echo "CONFIG_CPU_FREQ_GOV_SCHEDUTIL=y" >> .config
+        
+        # I/O schedulers
+        echo "CONFIG_MQ_IOSCHED_DEADLINE=y" >> .config
+        echo "CONFIG_MQ_IOSCHED_KYBER=y" >> .config
+        echo "CONFIG_IOSCHED_BFQ=n" >> .config
+        echo "CONFIG_DEFAULT_DEADLINE=y" >> .config
+        echo "CONFIG_DEFAULT_IOSCHED=deadline" >> .config
+        
+        # CPU governors
+        echo "CONFIG_CPU_FREQ_GOV_PERFORMANCE=y" >> .config
+        echo "CONFIG_CPU_FREQ_GOV_POWERSAVE=n" >> .config
+        echo "CONFIG_CPU_FREQ_GOV_USERSPACE=n" >> .config
+        echo "CONFIG_CPU_FREQ_GOV_ONDEMAND=y" >> .config
+        echo "CONFIG_CPU_FREQ_GOV_CONSERVATIVE=n" >> .config
+        echo "CONFIG_CPU_FREQ_GOV_SCHEDUTIL=y" >> .config
+        echo "CONFIG_CPU_FREQ_DEFAULT_GOV_PERFORMANCE=y" >> .config
+        
+        # GPU optimizations
+        echo "CONFIG_DEVFREQ_GOV_PERFORMANCE=y" >> .config
+        echo "CONFIG_DEVFREQ_GOV_POWERSAVE=n" >> .config
+        echo "CONFIG_DEVFREQ_GOV_USERSPACE=n" >> .config
+        echo "CONFIG_DEVFREQ_GOV_SIMPLE_ONDEMAND=y" >> .config
+        echo "CONFIG_DRM_MSM_PERFORMANCE=y" >> .config
+        echo "CONFIG_DRM_MSM_GPU_SUPPORT=y" >> .config
+        echo "CONFIG_DRM_MSM_GPU_SMMU=y" >> .config
+        echo "CONFIG_DRM_MSM_GPU_STATE=n" >> .config
+        echo "CONFIG_DRM_MSM_GPU_HANGCHECK=n" >> .config
+        
+        # Memory optimizations
+        echo "CONFIG_DEBUG_MEMORY_INIT=n" >> .config
+        echo "CONFIG_DEBUG_SHIRQ=n" >> .config
+        echo "CONFIG_DEBUG_STACKOVERFLOW=n" >> .config
+        echo "CONFIG_DEBUG_STACK_USAGE=n" >> .config
+        echo "CONFIG_TRANSPARENT_HUGEPAGE=y" >> .config
+        echo "CONFIG_TRANSPARENT_HUGEPAGE_ALWAYS=y" >> .config
+        echo "CONFIG_CLEANCACHE=y" >> .config
+        echo "CONFIG_FRONTSWAP=y" >> .config
+        echo "CONFIG_ZSWAP=y" >> .config
+        echo "CONFIG_ZRAM=y" >> .config
+        echo "CONFIG_ZRAM_MEMORY_TRACKING=n" >> .config
+        
+        # Network optimizations
+        echo "CONFIG_NET_DROP_MONITOR=n" >> .config
+        echo "CONFIG_NET_SCH_FQ_CODEL=y" >> .config
+        echo "CONFIG_TCP_CONG_ADVANCED=y" >> .config
+        echo "CONFIG_TCP_CONG_BBR=y" >> .config
+        echo "CONFIG_TCP_CONG_CUBIC=y" >> .config
+        echo "CONFIG_TCP_CONG_WESTWOOD=y" >> .config
+        echo "CONFIG_DEFAULT_TCP_CONG=cubic" >> .config
+        
+        # File system optimizations
+        echo "CONFIG_FS_DEBUG=n" >> .config
+        echo "CONFIG_EXT4_DEBUG=n" >> .config
+        echo "CONFIG_EXT4_FS_DEBUG=n" >> .config
+        echo "CONFIG_F2FS_DEBUG=n" >> .config
+        echo "CONFIG_EXT4_FS_POSIX_ACL=y" >> .config
+        echo "CONFIG_EXT4_FS_SECURITY=y" >> .config
+        echo "CONFIG_F2FS_FS_POSIX_ACL=y" >> .config
+        echo "CONFIG_F2FS_FS_SECURITY=y" >> .config
+        echo "CONFIG_F2FS_FAULT_INJECTION=n" >> .config
+        
+        # KernelSU
+        echo "CONFIG_KSU=y" >> .config
+        echo "CONFIG_KSU_SUSFS=y" >> .config
+        
+        # Extreme gaming profile
+        if [ "$PROFILE" = "extreme" ]; then
+          echo "# ===== EXTREME GAMING PROFILE =====" >> .config
+          echo "CONFIG_SMP=n" >> .config
+          echo "CONFIG_NUMA=n" >> .config
+          echo "CONFIG_PREEMPT=y" >> .config
+          echo "CONFIG_PREEMPT_VOLUNTARY=n" >> .config
+          echo "CONFIG_PREEMPT_NONE=n" >> .config
+          echo "CONFIG_CPU_FREQ_DEFAULT_GOV_PERFORMANCE=y" >> .config
+        fi
         
         # Regenerate config
         make olddefconfig
+        
+        echo "=== Final kernel config ==="
+        grep -E "CONFIG_HZ|CONFIG_PRINTK|CONFIG_DEBUG|CONFIG_KSU|CONFIG_CPU_FREQ" .config || true
 
-    - name: Build kernel
+    - name: Build kernel with optimizations
       run: |
         cd kernel
         export ARCH=arm64
         export CROSS_COMPILE=aarch64-linux-android-
         export CLANG_TRIPLE=aarch64-linux-gnu-
-        export LLVM=1
-        export LLVM_IAS=1
         
-        # Use ccache if available
+        # Use LLVM if available
+        if [ "$CLANG_FOUND" = "true" ] || [ "$CLANG_SYSTEM" = "true" ]; then
+          export LLVM=1
+          export LLVM_IAS=1
+        else
+          # Fallback to GCC
+          export CROSS_COMPILE=aarch64-linux-gnu-
+        fi
+        
         export PATH="/usr/lib/ccache:$PATH"
         export CCACHE_DIR=${{ github.workspace }}/.ccache
         
-        # Build the kernel with multiple jobs
+        # Optimized compiler flags
+        export CFLAGS="-O3 -march=armv8-a+crc+crypto -mtune=cortex-a76 -pipe -fomit-frame-pointer -funroll-loops"
+        export CXXFLAGS="$CFLAGS"
+        export LDFLAGS="-Wl,-O3,--sort-common,--as-needed"
+        
+        echo "Building kernel with gaming optimizations..."
         make -j$(nproc --all) 2>&1 | tee build.log
         
-        # Check if build succeeded
         if [ ! -f "arch/arm64/boot/Image" ]; then
           echo "Build failed! Check build.log"
           cat build.log
           exit 1
         fi
 
-    - name: Prepare AnyKernel3
+    - name: Prepare AnyKernel3 with gaming tweaks
       run: |
         git clone --depth=1 ${{ env.ANY_KERNEL_SOURCE }} anykernel
         cd anykernel
         
-        # Copy built kernel
         cp ../kernel/arch/arm64/boot/Image zImage
         
-        # Copy dtb if exists
         if [ -f "../kernel/arch/arm64/boot/dtb" ]; then
           cp ../kernel/arch/arm64/boot/dtb dtb
         fi
         
-        # Copy dtbo if exists
         if [ -f "../kernel/arch/arm64/boot/dtbo.img" ]; then
           cp ../kernel/arch/arm64/boot/dtbo.img dtbo
         fi
         
-        # Create anykernel.sh with proper settings
         cat > anykernel.sh << 'EOF'
         #!/sbin/sh
         
         # AnyKernel3 Ramdisk Mod Script
-        # osm0sis @ xda-developers
+        # Gaming Optimized GKI Kernel
         
-        # Properties
         device.name1=generic
         device.name2=gki
         device.name3=android
-        device.name4=
-        device.name5=
         
-        # Set to true if this is a GKI kernel
         gki=true
-        
-        # Set to true if this is a GKI 2.0 kernel
         gki_2_0=true
         
-        # boot image path
         block=/dev/block/by-name/boot;
-        
-        # Set up paths
         is_slot_device=auto;
         ramdisk_compression=auto;
-        
-        # Additional flags
         patch_vbmeta_flag=auto;
         add_vbmeta_hash=false;
         
-        # Import functions
         . tools/ak3-core.sh;
         
-        # Set kernel
+        set_gaming_tweaks() {
+          ui_print "  Applying gaming performance tweaks..."
+          
+          for cpu in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+            [ -f "$cpu" ] && echo "performance" > $cpu
+          done
+          
+          [ -f "/sys/class/kgsl/kgsl-3d0/devfreq/governor" ] && echo "performance" > /sys/class/kgsl/kgsl-3d0/devfreq/governor
+          
+          for queue in /sys/block/*/queue/scheduler; do
+            [ -f "$queue" ] && echo "deadline" > $queue
+          done
+          
+          for ra in /sys/block/*/queue/read_ahead_kb; do
+            [ -f "$ra" ] && echo "2048" > $ra
+          done
+          
+          [ -f "/proc/sys/vm/swappiness" ] && echo "20" > /proc/sys/vm/swappiness
+          [ -f "/proc/sys/vm/dirty_ratio" ] && echo "30" > /proc/sys/vm/dirty_ratio
+          [ -f "/proc/sys/vm/dirty_background_ratio" ] && echo "5" > /proc/sys/vm/dirty_background_ratio
+          [ -f "/proc/sys/vm/vfs_cache_pressure" ] && echo "50" > /proc/sys/vm/vfs_cache_pressure
+          
+          [ -f "/proc/sys/kernel/panic" ] && echo "0" > /proc/sys/kernel/panic
+          [ -f "/proc/sys/kernel/printk" ] && echo "0 0 0 0" > /proc/sys/kernel/printk
+          
+          ui_print "  Gaming tweaks applied!"
+        }
+        
         dump_boot;
+        set_gaming_tweaks;
         write_boot;
         EOF
-            
-            chmod +x anykernel.sh
-    
-        - name: Package AnyKernel3
-          run: |
-            cd anykernel
-            # Remove git files
-            rm -rf .git .gitignore .github
-            
-            # Create zip
-            zip -r9 ../KernelSU-GKI-5.10-${{ github.sha }}.zip * -x "*.git*" "tools/ak3-core.sh" "META-INF/*"
-            cd ..
-    
-        - name: Upload build artifacts
-          uses: actions/upload-artifact@v4
-          with:
-            name: KernelSU-GKI-5.10
-            path: |
-              KernelSU-GKI-*.zip
-              kernel/build.log
-              kernel/arch/arm64/boot/Image
-              kernel/.config
-            if-no-files-found: error
-    
-        - name: Create Release
-          if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-          uses: softprops/action-gh-release@v1
-          with:
-            tag_name: v1.0.${{ github.run_number }}
-            name: KernelSU GKI 5.10 Build ${{ github.run_number }}
-            body: |
-              ## GKI Android 12-5.10 Kernel with KernelSU
-              
-              ### Build Info
-              - Kernel Version: 5.10
-              - Android Version: 12
-              - CONFIG_HZ: 300
-              - Build Date: $(date)
-              - KernelSU Source: ${{ env.KERNELSU_SOURCE }}
-              
-              ### Changes
-              - Integrated KernelSU
-              - Optimized with CONFIG_HZ=300
-              - Built with latest Clang
-              
-              ### Download
-              Flash the AnyKernel3 zip in your custom recovery.
-            files: |
-              KernelSU-GKI-*.zip
-              kernel/build.log
-          env:
-            GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        
+        chmod +x anykernel.sh
+
+    - name: Package AnyKernel3
+      run: |
+        cd anykernel
+        rm -rf .git .gitignore .github
+        
+        PROFILE="${{ github.event.inputs.performance_profile || 'gaming' }}"
+        zip -r9 ../KernelSU-GKI-5.10-${PROFILE}-${{ github.sha }}.zip * -x "*.git*" "tools/ak3-core.sh" "META-INF/*"
+        cd ..
+
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: KernelSU-GKI-5.10-Gaming
+        path: |
+          KernelSU-GKI-*.zip
+          kernel/build.log
+          kernel/arch/arm64/boot/Image
+          kernel/.config
+        if-no-files-found: error
+
+    - name: Create Release
+      if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: v1.0.${{ github.run_number }}
+        name: Gaming Kernel GKI 5.10 Build ${{ github.run_number }}
+        body: |
+          ## 🎮 Gaming Optimized GKI Kernel with KernelSU
+          
+          ### Build Info
+          - Profile: ${{ github.event.inputs.performance_profile || 'gaming' }}
+          - CONFIG_HZ: 300
+          - All logging disabled
+          - Performance CPU governor
+          - Deadline I/O scheduler
+          
+          ### Download
+          Flash the AnyKernel3 zip in your custom recovery.
+        files: |
+          KernelSU-GKI-*.zip
+          kernel/build.log
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
