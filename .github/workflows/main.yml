@@ -1,0 +1,291 @@
+name: Build GKI Kernel 5.10 with KernelSU
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+    inputs:
+      custom_config:
+        description: 'Custom defconfig name (without _defconfig)'
+        required: false
+        default: 'gki_defconfig'
+        type: string
+
+env:
+  KERNEL_SOURCE: https://github.com/ramabondanp/android_kernel_common-5.10
+  KERNELSU_SOURCE: https://github.com/RapliVx/KernelSU
+  ANY_KERNEL_SOURCE: https://github.com/osm0sis/AnyKernel3
+  KERNEL_VERSION: 5.10
+  ANDROID_VERSION: 12
+  CLANG_VERSION: r498229b
+
+jobs:
+  build-kernel:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up build environment
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          git \
+          make \
+          bc \
+          bison \
+          flex \
+          libssl-dev \
+          libelf-dev \
+          device-tree-compiler \
+          python3 \
+          python3-pip \
+          wget \
+          unzip \
+          cpio \
+          ccache \
+          lz4 \
+          zstd \
+          pahole \
+          dwarves \
+          kmod \
+          xmlto \
+          docbook-utils \
+          fakeroot \
+          build-essential
+
+    - name: Setup ccache
+      uses: hendrikmuhs/ccache-action@v1.2
+      with:
+        key: ${{ runner.os }}-ccache-${{ github.sha }}
+        restore-keys: |
+          ${{ runner.os }}-ccache-
+
+    - name: Install repo tool
+      run: |
+        sudo pip3 install repo
+
+    - name: Clone kernel source
+      run: |
+        git clone --depth=1 ${{ env.KERNEL_SOURCE }} kernel
+        cd kernel
+        git fetch --unshallow || true
+
+    - name: Clone KernelSU
+      run: |
+        cd kernel
+        git clone --depth=1 ${{ env.KERNELSU_SOURCE }} KernelSU
+
+    - name: Setup Clang toolchain
+      run: |
+        wget -O clang.zip https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-${{ env.CLANG_VERSION }}.tar.gz
+        mkdir -p clang
+        tar -xzf clang.zip -C clang
+        echo "PATH=$(pwd)/clang/bin:$PATH" >> $GITHUB_ENV
+        
+        # Setup GCC for compatibility
+        wget -O gcc-arm64.tar.xz https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/+archive/refs/heads/main.tar.gz
+        mkdir -p gcc-arm64
+        tar -xf gcc-arm64.tar.xz -C gcc-arm64
+        echo "PATH=$(pwd)/gcc-arm64/bin:$PATH" >> $GITHUB_ENV
+
+    - name: Apply KernelSU patches
+      run: |
+        cd kernel
+        # Check if KernelSU has setup scripts
+        if [ -f "KernelSU/setup.sh" ]; then
+          bash KernelSU/setup.sh
+        else
+          # Manual KernelSU integration
+          # For GKI kernels
+          echo "Applying KernelSU patches..."
+          KERNELSU_DIR=$(pwd)/KernelSU
+          
+          # Apply kernel patches
+          if [ -d "$KERNELSU_DIR/kernel" ]; then
+            # Copy kernel files
+            cp -r $KERNELSU_DIR/kernel/* .
+            
+            # Apply any patches if they exist
+            if [ -d "$KERNELSU_DIR/patches" ]; then
+              for patch in $KERNELSU_DIR/patches/*.patch; do
+                patch -p1 < $patch || true
+              done
+            fi
+          fi
+        fi
+
+    - name: Configure kernel
+      run: |
+        cd kernel
+        # Clean any previous builds
+        make clean || true
+        make mrproper || true
+        
+        # Set up environment variables for cross compilation
+        export ARCH=arm64
+        export CROSS_COMPILE=aarch64-linux-android-
+        export CLANG_TRIPLE=aarch64-linux-gnu-
+        export LLVM=1
+        export LLVM_IAS=1
+        
+        # Use custom defconfig or default
+        DEFCONFIG="${{ github.event.inputs.custom_config || 'gki_defconfig' }}"
+        make $DEFCONFIG
+        
+        # Enable KernelSU configs if needed
+        echo "CONFIG_KSU=y" >> .config
+        echo "CONFIG_KSU_SUSFS=y" >> .config
+        
+        # Set CONFIG_HZ to 300 for better performance
+        echo "CONFIG_HZ_300=y" >> .config
+        echo "CONFIG_HZ=300" >> .config
+        sed -i 's/CONFIG_HZ=.*/CONFIG_HZ=300/' .config
+        
+        # Disable any problematic configs
+        echo "# Disable problematic options" >> .config
+        echo "CONFIG_DEBUG_INFO=n" >> .config
+        echo "CONFIG_DEBUG_INFO_REDUCED=n" >> .config
+        echo "CONFIG_DEBUG_INFO_COMPRESSED=n" >> .config
+        echo "CONFIG_DEBUG_FS=n" >> .config
+        echo "CONFIG_DEBUG_KERNEL=n" >> .config
+        
+        # Regenerate config
+        make olddefconfig
+
+    - name: Build kernel
+      run: |
+        cd kernel
+        export ARCH=arm64
+        export CROSS_COMPILE=aarch64-linux-android-
+        export CLANG_TRIPLE=aarch64-linux-gnu-
+        export LLVM=1
+        export LLVM_IAS=1
+        
+        # Use ccache if available
+        export PATH="/usr/lib/ccache:$PATH"
+        export CCACHE_DIR=${{ github.workspace }}/.ccache
+        
+        # Build the kernel with multiple jobs
+        make -j$(nproc --all) 2>&1 | tee build.log
+        
+        # Check if build succeeded
+        if [ ! -f "arch/arm64/boot/Image" ]; then
+          echo "Build failed! Check build.log"
+          cat build.log
+          exit 1
+        fi
+
+    - name: Prepare AnyKernel3
+      run: |
+        git clone --depth=1 ${{ env.ANY_KERNEL_SOURCE }} anykernel
+        cd anykernel
+        
+        # Copy built kernel
+        cp ../kernel/arch/arm64/boot/Image zImage
+        
+        # Copy dtb if exists
+        if [ -f "../kernel/arch/arm64/boot/dtb" ]; then
+          cp ../kernel/arch/arm64/boot/dtb dtb
+        fi
+        
+        # Copy dtbo if exists
+        if [ -f "../kernel/arch/arm64/boot/dtbo.img" ]; then
+          cp ../kernel/arch/arm64/boot/dtbo.img dtbo
+        fi
+        
+        # Create anykernel.sh with proper settings
+        cat > anykernel.sh << 'EOF'
+        #!/sbin/sh
+        
+        # AnyKernel3 Ramdisk Mod Script
+        # osm0sis @ xda-developers
+        
+        # Properties
+        device.name1=generic
+        device.name2=gki
+        device.name3=android
+        device.name4=
+        device.name5=
+        
+        # Set to true if this is a GKI kernel
+        gki=true
+        
+        # Set to true if this is a GKI 2.0 kernel
+        gki_2_0=true
+        
+        # boot image path
+        block=/dev/block/by-name/boot;
+        
+        # Set up paths
+        is_slot_device=auto;
+        ramdisk_compression=auto;
+        
+        # Additional flags
+        patch_vbmeta_flag=auto;
+        add_vbmeta_hash=false;
+        
+        # Import functions
+        . tools/ak3-core.sh;
+        
+        # Set kernel
+        dump_boot;
+        write_boot;
+        EOF
+            
+            chmod +x anykernel.sh
+    
+        - name: Package AnyKernel3
+          run: |
+            cd anykernel
+            # Remove git files
+            rm -rf .git .gitignore .github
+            
+            # Create zip
+            zip -r9 ../KernelSU-GKI-5.10-${{ github.sha }}.zip * -x "*.git*" "tools/ak3-core.sh" "META-INF/*"
+            cd ..
+    
+        - name: Upload build artifacts
+          uses: actions/upload-artifact@v4
+          with:
+            name: KernelSU-GKI-5.10
+            path: |
+              KernelSU-GKI-*.zip
+              kernel/build.log
+              kernel/arch/arm64/boot/Image
+              kernel/.config
+            if-no-files-found: error
+    
+        - name: Create Release
+          if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+          uses: softprops/action-gh-release@v1
+          with:
+            tag_name: v1.0.${{ github.run_number }}
+            name: KernelSU GKI 5.10 Build ${{ github.run_number }}
+            body: |
+              ## GKI Android 12-5.10 Kernel with KernelSU
+              
+              ### Build Info
+              - Kernel Version: 5.10
+              - Android Version: 12
+              - CONFIG_HZ: 300
+              - Build Date: $(date)
+              - KernelSU Source: ${{ env.KERNELSU_SOURCE }}
+              
+              ### Changes
+              - Integrated KernelSU
+              - Optimized with CONFIG_HZ=300
+              - Built with latest Clang
+              
+              ### Download
+              Flash the AnyKernel3 zip in your custom recovery.
+            files: |
+              KernelSU-GKI-*.zip
+              kernel/build.log
+          env:
+            GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
